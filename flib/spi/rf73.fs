@@ -80,12 +80,12 @@ calign
   $1D rf@ 0= if
     $73 $50 rf!  \ activate extra features
   then
-  23 $25 rf!  \ use channel 23
   rf:init0 rf-config!
   1 bank!
   rf:init1 rf-config!
-  \ 8 rf@ hex.  \ will be $63 for RFM70
+  \ 8 rf@ hex.  \ will be $63 for RFM70 and RFM73
   0 bank!
+  23 $25 rf!  \ use channel 23
   rx-mode ;
 
 : rf-recv ( -- b )  \ check whether a packet has been received, return #bytes
@@ -98,6 +98,17 @@ calign
     -spi
 \   +spi $E2 >spi -spi  \ FLUSH_RX
   then ;
+
+: rf-send ( addr count hdr -- )  \ send out one packet
+  if $A0 else $B0 then
+  tx-mode
+  +spi >spi
+  0 do dup c@ >spi 1+ loop
+  -spi drop
+  begin
+    $07 rf@ $30 and
+  ?dup until
+  $27 rf! rx-mode ;
 
 : rf-info ( -- )  \ display reception parameters as hex string
   23 h.2 ;
@@ -112,6 +123,9 @@ calign
       loop  cr
     then
   key? until ;
+
+: rf-txtest ( n -- )  \ send out a test packet with the number as ASCII chars
+  0 <# #s #> 1 rf-send ;
 
 : rf. ( -- )  \ print out the RF73 bank 0 registers
   cr 4 spaces  base @ hex  16 0 do space i . loop  base !
