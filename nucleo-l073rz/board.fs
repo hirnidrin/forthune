@@ -32,7 +32,7 @@ PC13 constant BUTTON
   ." ram/flash: " . . ." free " ;
 
 : init ( -- )  \ board initialisation
-\  init  \ does not exist in default Mecrisp image
+  init  \ explicitly init usart comms, only required in the Mecrisp "spezial" branch
   ['] ct-irq irq-fault !  \ show call trace in unhandled exceptions
   $00 hex.empty !  \ empty flash shows up as $00 iso $FF on these chips
   OMODE-PP LED io-mode!
