@@ -38,13 +38,13 @@ PC13 constant BUTTON
   OMODE-PP LED io-mode!
   IMODE-FLOAT BUTTON io-mode!
 \ 16MHz ( set by Mecrisp on startup to get an accurate USART baud rate )
-  2 RCC-CCIPR !  \ set USART1 clock to HSI16, independent of sysclk
+  8 RCC-CCIPR !  \ set USART2 clock to HSI16, independent of sysclk
   1000 systick-hz
   hello ." ok." cr
 ;
 
-: rx-connected? ( -- f )  \ true if USART1 RX is connected (and idle)
-  IMODE-LOW PA10 io-mode!  PA10 io@ 0<>  OMODE-AF-PP PA10 io-mode!
+: rx-connected? ( -- f )  \ true if USART2 RX is connected (and idle)
+  IMODE-LOW PA3 io-mode!  PA3 io@ 0<>  OMODE-AF-PP PA3 io-mode!
   dup if 1 ms serial-key? if serial-key drop then then \ flush any input noise
 ;
 
