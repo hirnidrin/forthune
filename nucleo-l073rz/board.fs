@@ -16,6 +16,8 @@ include ../flib/stm32l0/timer.fs
 include ../flib/stm32l0/pwm.fs
 include ../flib/stm32l0/i2c.fs
 include ../flib/stm32l0/sleep.fs
+
+PB6 variable ssel  \ SPI1 chip select pin on Nucleo-L073RZ board, can be changed at run time
 include ../flib/stm32l0/spi.fs
 
 \ the green user LED on the Nucleo-L073RZ board
