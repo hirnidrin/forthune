@@ -1,6 +1,5 @@
 \ Hardware I2C driver for STM32F103.
-\ TODO
-\ Document
+\ Needs: ring.fs
 
 \ Define pins
 [ifndef] SCL  PB6 constant SCL  [then]
@@ -106,10 +105,7 @@ $40005800 constant I2C2
   i2c-stop! ;
 : i2c-EV7   i2c-SR1-RxNE i2c-SR1-wait ;
 
-: i2c-addr ( u --)
-  \ Start a new transaction and send address in write mode
-  \ Does not wait for ADDR: i2x-xfer should do this
-
+: i2c-addr     ( u --)  \ Start a new transaction
   i2c-SR2-BUSY begin pause dup i2c-SR2-flag? 0= until drop 
 
   i2c.txbuf i2c-bufsize init-ring
@@ -215,8 +211,7 @@ $40005800 constant I2C2
   * clock-hz @ swap /
 ;
 
-\ Configure I2C for Standard Mode
-: i2c-standard
+: i2c-standard ( -- )   \ Configure I2C for Standard Mode (~100kHz)
   0  bit  I2C1-CR1 hbic!                          \ Disable peripheral
   i2c-SR2-BUSY begin pause dup i2c-SR2-flag? 0= until drop 
   
@@ -229,7 +224,7 @@ $40005800 constant I2C2
 ;
 
 \ Configure I2C for Fast Mode
-: i2c-fast
+: i2c-fast     ( -- )   \ Configure I2C for fast mode (~400kHz)
   0  bit  I2C1-CR1 hbic!                          \ Disable peripheral
   i2c-SR2-BUSY begin pause dup i2c-SR2-flag? 0= until drop 
   
@@ -242,8 +237,7 @@ $40005800 constant I2C2
   0  bit 10 bit or            I2C1-CR1   hbis!      \ Enable peripheral & ACK
 ;
 
-\ Init and reset I2C. Probably overkill. TODO simplify
-: i2c-init ( -- )
+: i2c-init     ( -- )   \ Init and reset I2C. Default to 100 kHz
   \ Reset I2C1
   APB1-RST-I2C1 RCC-APB1RSTR bis!
   APB1-RST-I2C1 RCC-APB1RSTR bic!
@@ -282,9 +276,7 @@ $40005800 constant I2C2
  ;
 
 \ The meat of the I2C driver is in this function
-: i2c-xfer ( n -- nak ) \ prepares for reading an nbyte reply.
-  \ Use after i2c-addr and optional >i2c calls.
-  \ 
+: i2c-xfer     ( n -- nak ) \ Prepares for reading an nbyte reply.
   i2c.cnt !                                  \ Store #rx
   i2c.txbuf ring# 0=      ( #tx=0   )
 
@@ -336,24 +328,24 @@ $40005800 constant I2C2
   then
 ;
 
-: >i2c  ( u -- ) \ Queues byte u for transmission over i2c. Use after i2c-addr
+: >i2c         ( u -- ) \ Queues byte u for transmission over i2c. Use after i2c-addr
   i2c.txbuf >ring ;
 
-: i2c>  ( -- u ) \ Receives 1 byte from i2c. Use after i2c-xfer. Waits.
+: i2c>         ( -- u ) \ Receives 1 byte from i2c. Use after i2c-xfer. Waits.
   begin i2c.rxbuf ring# 0<> until 
   i2c.rxbuf ring> ;
 
-: i2c>h ( -- u ) \ Receives 16 bit word from i2c, lsb first.
+: i2c>h        ( -- u ) \ Receives 16 bit word from i2c, lsb first.
     i2c>   i2c>  8 lshift or ;
 
-: i2c>h_inv ( -- u ) \ Receives 16 bit word from i2c, msb first.
+: i2c>h_inv    ( -- u ) \ Receives 16 bit word from i2c, msb first.
     i2c>  8 lshift i2c>  or ;
 
 : i2c-probe ( addr -- nak )
   i2c-addr 0 i2c-xfer
   ;
 
-: i2c. ( -- )  \ scan and report all I2C devices on the bus
+: i2c.         ( -- )   \ scan and report all I2C devices on the bus
   128 0 do
     cr i h.2 ." :"
     16 0 do  space i j +
