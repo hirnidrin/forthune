@@ -1,44 +1,243 @@
 \ Hardware I2C driver for STM32F103.
+\ Needs: ring.fs
 
 \ Define pins
 [ifndef] SCL  PB6 constant SCL  [then]
 [ifndef] SDA  PB7 constant SDA  [then]
 
+\ Buffers
+[ifndef] i2c-bufsize 128 constant i2c-bufsize [then]
+
+i2c-bufsize 4 + buffer: i2c.txbuf
+i2c-bufsize 4 + buffer: i2c.rxbuf
+i2c.txbuf i2c-bufsize init-ring
+i2c.rxbuf i2c-bufsize init-ring
+
+\ Variables
+0 variable i2c.addr
+0 variable i2c.cnt
+0 variable i2c.collect
+
+\ Register definitions
 $40005400 constant I2C1
 $40005800 constant I2C2
      I2C1 $00 + constant I2C1-CR1
      I2C1 $04 + constant I2C1-CR2
-     I2C1 $08 + constant I2C1-OAR1
-     I2C1 $0C + constant I2C1-OAR2
      I2C1 $10 + constant I2C1-DR
      I2C1 $14 + constant I2C1-SR1
      I2C1 $18 + constant I2C1-SR2
      I2C1 $1C + constant I2C1-CCR
      I2C1 $20 + constant I2C1-TRISE
+\ $40021000 constant RCC
+     RCC $10 + constant RCC-APB1RSTR
+     RCC $14 + constant RCC-AHBENR
 
+    [ifndef] DMA1 $40020000 constant DMA1 [then]
+
+    DMA1      constant DMA1-ISR
+    DMA1 4  + constant DMA1-IFCR
+    
+    DMA1 20 6 1- * + 
+    dup $08 + constant DMA1-CCR6
+    dup $0c + constant DMA1-CNDTR6
+    dup $10 + constant DMA1-CPAR6
+    dup $14 + constant DMA1-CMAR6
+    drop
+    
+    DMA1 20 7 1- * + 
+    dup $08 + constant DMA1-CCR7
+    dup $0c + constant DMA1-CNDTR7
+    dup $10 + constant DMA1-CPAR7
+    dup $14 + constant DMA1-CMAR7
+    drop
+         
+    $E000E000 constant NVIC  
+    NVIC $100 + constant NVIC_ISER0 
+
+\ Register constants
 3  bit constant APB2-GPIOB-EN
 0  bit constant APB2-AFIO-EN
 21 bit constant APB1-I2C1-EN
 21 bit constant APB1-RST-I2C1
 
-\ $40021000 constant RCC
-\    RCC $00 + constant RCC-CR
-\    RCC $04 + constant RCC-CFGR
-     RCC $10 + constant RCC-APB1RSTR
-     RCC $14 + constant RCC-AHBENR
-\    RCC $18 + constant RCC-APB2ENR
-\    RCC $1C + constant RCC-APB1ENR
+0  bit constant i2c-SR1-SB
+1  bit constant i2c-SR1-ADDR
+2  bit constant i2c-SR1-BTF
+6  bit constant i2c-SR1-RxNE
+7  bit constant i2c-SR1-TxE
+10 bit constant i2c-SR1-AF
+0  bit constant i2c-SR2-MSL 
+1  bit constant i2c-SR2-BUSY
 
-     0 variable i2c.cnt
-     0 variable i2c.addr
-     0 variable i2c.needstop
- $ffff variable i2c.timeout
+\ Bit setting
+: i2c-ACK-1 ( -- ) 10 bit I2C1-CR1 hbis! ;
+: i2c-ACK-0 ( -- ) 10 bit I2C1-CR1 hbic! ;
 
-\ Checks I2C1 busy bit
-: i2c-busy?   ( -- b) I2C1-SR2 h@ 1 bit and 0<> ;
+\ Status checks
+: i2c-SR1-flag? I2C1-SR1 hbit@ ;
+: i2c-SR2-flag? I2C1-SR2 hbit@ ;
+: i2c-SR1-wait  ( u -- )   begin dup i2c-SR1-flag?    until drop ;
+: i2c-SR2-!wait ( u -- )   begin dup i2c-SR2-flag? 0= until drop ; 
 
-\ Init and reset I2C. Probably overkill. TODO simplify
-: i2c-init ( -- )
+\ debugging
+: i2c? cr I2C1-CR1 h@ hex. I2C1-CR2 h@ hex. I2C1-SR1 h@ hex. I2C1-SR2 h@ hex. ;
+
+\ Low level register setting and reading
+: i2c-start! ( -- ) 8 bit I2C1-CR1 hbis! ;
+: i2c-stop!  ( -- ) 9 bit I2C1-CR1 hbis! ;
+: i2c-start  ( -- ) \ set start bit and wait for start condition
+  i2c-start! i2c-SR1-SB i2c-SR1-wait ;
+: i2c-stop   ( -- ) \ stop and wait
+  i2c-stop! i2c-SR2-MSL i2c-SR2-!wait ; 
+: i2c-DR!    ( u -- )  I2C1-DR c! ;            \ Writes data register
+
+\ STM Events
+: i2c-EV8_2 i2c-SR1-BTF  i2c-SR1-wait ;
+: i2c-EV6a i2c-SR1-ADDR i2c-SR1-AF or i2c-SR1-wait ; \ performs the wait, does not clear ADDR
+: i2c-EV6b I2C1-SR1 h@ drop I2C1-SR2 h@ drop ;       \ clears ADDR
+: i2c-EV6 i2c-EV6a i2c-EV6b ;                        \ Performs full EV6 action
+: i2c-EV6_3
+  i2c-EV6a
+  i2c-SR1-AF i2c-SR1-flag?                   \ Put NAK on stack
+  i2c-SR1-AF i2c1-SR1 hbic!                  \ Clear the NAK fl
+  i2c-ACK-0
+  i2c-EV6b
+  i2c-stop! ;
+: i2c-EV7   i2c-SR1-RxNE i2c-SR1-wait ;
+
+: i2c-addr     ( u --)  \ Start a new transaction
+  i2c-SR2-BUSY begin pause dup i2c-SR2-flag? 0= until drop 
+
+  i2c.txbuf i2c-bufsize init-ring
+  i2c.rxbuf i2c-bufsize init-ring
+  shl i2c.addr !
+
+  i2c-ACK-1                                   \ reset ack in case we had an rx-1 before
+;
+
+: i2c-dma-enable ( channel -- )
+  11 bit I2C1-CR2  hbis!                      \ DMAEN
+  20 * DMA1 20 - 8 + +                        \ DMA1-CCRch 6 120+dma1-20+8
+  0 bit swap bis!
+;
+
+: i2c-dma-disable ( channel -- )
+  11 bit I2C1-CR2 hbic!
+  0 bit
+  swap 20 * DMA1 20 - 8 + +                   \ DMA1-CCRch
+  bic!
+;
+
+: i2c-irq-err? ( channel -- )                 \ Was the irq triggered by error?
+  1- 4 * 3 + bit DMA1-ISR bit@ inline ;       \ TEIFx 
+
+
+: i2c-irq-done? ( channel -- )                \ Was the irq for complete xfer?
+  1- 4 * 1 + bit DMA1-ISR bit@ inline ;       \ TCIFx
+
+: i2c-send-addr             ( rx? -- nak )
+  i2c.addr @  or i2c-DR!                     \ calculate address
+  i2c-EV6a                                   \ Wait for addr to happen
+  i2c-SR1-AF i2c-SR1-flag?                   \ Put NAK on stack
+  i2c-SR1-AF i2c1-SR1 hbic!                  \ Clear the NAK fl
+  i2c-EV6b                                   \ end addr
+;
+
+: i2c-rx-1
+  i2c.addr @ 1 or i2c-DR!   \ Read address
+  i2c-EV6_3
+  i2c-EV7
+  I2C1-DR @ i2c.rxbuf >ring
+;
+
+\ Dispatches all the DMA interrupts TODO call of collect not yet working
+: i2c-irq-dispatch ( -- )
+  ipsr dup $fe and  32 <> if drop i2c.collect @ execute exit then  ( ipsr)
+  \ i2c.irq-handler @ execute
+  case
+    32 of \ TX event: stop or RX 
+      6 i2c-irq-done? if
+        6 i2c-dma-disable
+        21 bit DMA1-IFCR  bis!                    \ CTCIF6
+        i2c.cnt @ case
+          0 of
+            i2c-EV8_2 i2c-stop
+            begin 9 bit I2C1-CR1 hbit@ 0= until   \ Wait for STOP to clear
+          endof
+          1 of
+            \ Wait for TxE: don't clobber last byte
+            i2c-SR1-TxE i2c-SR1-wait
+            i2c-start                             \ Restart
+            i2c-rx-1 drop                         \ discard nak
+          endof
+          ( #rx )
+          \ Wait for TxE: don't clobber last byte
+          i2c-SR1-TxE i2c-SR1-wait
+          \ Configure DMA 7
+          7 i2c-dma-enable
+          \ Start rx (will wait for I2C1 to be ready)
+          12 bit I2C1-CR2  hbis!                  \ LAST
+          \ Send restart  
+          i2c-start                               \ Restart
+          1 i2c-send-addr drop
+        endcase
+      else i2c-stop then                        \ Error irq: give up
+    endof
+    33 of \ RX event: always stop
+      7 i2c-irq-done? if
+        7 i2c-dma-disable
+        25 bit DMA1-IFCR  bis!                    \ CTCIF7
+        i2c-stop
+        begin 9 bit I2C1-CR1 hbit@ 0= until       \ Wait for STOP to clear
+        \ Let RX buffer know of new data
+        i2c.cnt @ i2c.rxbuf 1+ c!
+      else i2c-stop then                          \ Error irq: give up
+    endof
+  endcase
+  i2c.collect @ execute
+;
+
+\ APB1 speed
+: apb1-hz ( -- u )
+  RCC-CFGR @ 
+  dup $80 and if 
+    dup $70 and 4 rshift
+    dup 2 bit and if 1+ then
+    1+ bit 
+  else 1 
+  then   \ HPRE prescaler
+  swap ( HPRE CFGR)
+  dup 10 bit and if $300 and 8 rshift 1+ bit else drop 1 then   \ PPRE1 prescaler
+  * clock-hz @ swap /
+;
+
+: i2c-standard ( -- )   \ Configure I2C for Standard Mode (~100kHz)
+  0  bit  I2C1-CR1 hbic!                          \ Disable peripheral
+  i2c-SR2-BUSY begin pause dup i2c-SR2-flag? 0= until drop 
+  
+  $3F                   I2C1-CR2   hbic!          \ CLEAR FREQ field
+  apb1-hz 1000    /                               \ APB1 speed (kHz)
+  dup     1000    / dup I2C1-CR2   hbis!          \ Set current clock speed (MHz)
+  1+                    I2C1-TRISE h!             \ APB1(MHz)+1 for 1000ns SCL
+  ( kHz)  2 100 * /     I2C1-CCR   h!             \ Select 100 kHz Fast mode
+  0  bit 10 bit or      I2C1-CR1   hbis!          \ Enable peripheral & ACK
+;
+
+\ Configure I2C for Fast Mode
+: i2c-fast     ( -- )   \ Configure I2C for fast mode (~400kHz)
+  0  bit  I2C1-CR1 hbic!                          \ Disable peripheral
+  i2c-SR2-BUSY begin pause dup i2c-SR2-flag? 0= until drop 
+  
+  $3F                         I2C1-CR2   hbic!      \ CLEAR FREQ field
+  apb1-hz 1000    /                                 \ APB1 speed (kHz)
+  dup     1000    / dup       I2C1-CR2   hbis!      \ Set current clock speed (MHz)
+  3 / 1+                      I2C1-TRISE h!         \ APB1(MHz)/3+1 for 333ns SCL
+  ( kHz) 5000 + 25 400 * /                          \ Calculate ccr, round up
+  $c000 or                    I2C1-CCR   h!         \ Select 400kHz Fast Mode 16:9 duty
+  0  bit 10 bit or            I2C1-CR1   hbis!      \ Enable peripheral & ACK
+;
+
+: i2c-init     ( -- )   \ Init and reset I2C. Default to 100 kHz
   \ Reset I2C1
   APB1-RST-I2C1 RCC-APB1RSTR bis!
   APB1-RST-I2C1 RCC-APB1RSTR bic!
@@ -59,227 +258,94 @@ $40005800 constant I2C2
 
   \ Enable I2C peripheral
   21 bit RCC-APB1ENR bis!  \ set I2C1EN
-  $3F I2C1-CR2 hbic!       \ CLEAR FREQ field
-  36 I2C1-CR2 hbis!        \ APB1 is 36 MHz
+  i2c-standard
+  i2c-SR2-BUSY begin pause dup i2c-SR2-flag? 0= until drop 
 
-  \ clock rate clock-hz; USB = 72 MHz
-  \ crystal 8mhz x 9
-  \ PLL 72 MHz / 2
-  \ 36 MHz AHB /6
-  \ 6 MHz ADC
-  \ 001D840A RCC-CFGR
-  \ SW: 10    PLL as clock
-  \ SWS: 10   PLL as clock
-  \ HPRE: 0   AHB = SYSCLK
-  \ PPRE1 100 APB1/PCLK1 = /2 must not be > 36 MHz
-  \ PPRE2 000 APB2/PCLK2 = /1
-  \ ADCPRE 10 ADCPRE = /6
-  \ PLLSRC 1  HSE = PLL input
-  \ PLLXTPRE 0 HSE /1
-  \ PLLMUL 0111 PLL = cryst x9
+  0  bit RCC-AHBENR bis!   \ Enable DMA peripheral clock
+  0  bit DMA1-CCR6  bic!   \ Disable it for now (ch 6 = I2C1 TX)
+  0  bit DMA1-CCR7  bic!   \ Disable it for now (ch 7 = I2C1 RX)
 
-  \ cryst 8MHz x9 = PLLCLK 72 MHZ
-  \ SYSCLK = PLLCLK = 72 MHz
-  \ SYSCLK / AHB prescale = 72MHz AHBCLK
-  \ AHBCLK / APB1 = 36MHz
-  \ AHBCLK / APB2 = 72MHz
-  \ I2C = APB1 = 36MHz
+  i2c.collect @ 0= if
+    irq-collection @ dup ['] unhandled = if
+      drop
+      ['] nop
+    then
+    i2c.collect ! 
+    ['] i2c-irq-dispatch irq-collection !
+  then
+ ;
 
-  \ Configure clock control registers?!
+\ The meat of the I2C driver is in this function
+: i2c-xfer     ( n -- nak ) \ Prepares for reading an nbyte reply.
+  i2c.cnt !                                  \ Store #rx
+  i2c.txbuf ring# 0=      ( #tx=0   )
 
-  27           \ CCR 27?
-  15 bit or    \ FM
-  I2C1-CCR h!  \ FREQ = 36MHZ, 31 ns; DUTY=0 3x 31ns = 10 MHz; must divide by 27
-  3  I2C1-TRISE h!         \ 2+1 for 1000ns SCL
+  \ Configure I2C1 peripheral
+  12 bit I2C1-CR2  hbic!                     \ LAST
+  \ Configure DMA 6
+  %0011000010011010 DMA1-CCR6   !
+  16 bit            NVIC_ISER0  !
+  i2c.txbuf 4 +     DMA1-CMAR6  !
+  I2C1-DR           DMA1-CPAR6  !
+  i2c.txbuf ring#   DMA1-CNDTR6 !            \ Count
+  \ Configure DMA 7
+  %0011000010001010 DMA1-CCR7   !   
+  17 bit            NVIC_ISER0  !
+  i2c.rxbuf 4 +     DMA1-CMAR7  !
+  I2C1-DR           DMA1-CPAR7  !
+  i2c.cnt @         DMA1-CNDTR7 !            \ Count
 
-  0  bit I2C1-CR1 hbis!    \ Enable bit
-  10 bit I2C1-CR1 hbis!    \ ACK enable
-
-  \ Wait for bus to initialize
-  i2c.timeout @ begin 1- dup 0= i2c-busy? 0= or until drop
-;
-
-\ debugging
-: i2c? cr I2C1-CR1 h@ hex. I2C1-CR2 h@ hex. I2C1-SR1 h@ hex. I2C1-SR2 h@ hex. ;
-
-\ Low level register setting and checking
-: i2c-DR!     ( c -- )  I2C1-DR c! ;            \ Writes data register
-: i2c-DR@     (  -- c ) I2C1-DR c@ ;            \ Writes data register
-: i2c-start!  ( -- )    8 bit I2C1-CR1 hbis! ;
-: i2c-stop!   ( -- )    9 bit I2C1-CR1 hbis! ;
-: i2c-AF-0 ( -- )  10 bit I2C1-SR1 hbic! ;      \ Clears AF flag
-: i2c-START-0 ( -- )   8 bit I2C1-CR1 hbic! ;   \ Clears START condition
-: i2c-SR1-flag? ( u -- ) I2C1-SR1 hbit@ ;
-: i2c-SR2-flag? ( u -- ) I2C1-SR2 hbit@ ;
-: i2c-ACK-1 ( -- ) 10 bit I2C1-CR1 hbis! ;
-: i2c-ACK-0 ( -- ) 10 bit I2C1-CR1 hbic! ;
-: i2c-POS-1 ( -- ) 11 bit I2C1-CR1 hbis! ;
-: i2c-POS-0 ( -- ) 11 bit I2C1-CR1 hbic! ;
-
-\ Low level status checking
-: i2c-sb?  ( -- b)   0  bit i2c-SR1-flag? ;     \ Gets start bit flag
-: i2c-nak? ( -- b)   10 bit i2c-SR1-flag? ;     \ Gets AF bit flag
-: i2c-TxE? ( -- b)   7  bit i2c-SR1-flag? ;     \ TX register empty
-: i2c-ADDR? ( -- b)  1  bit i2c-SR1-flag? ;     \ ADDR bit
-: i2c-MSL? ( -- b)   0  bit I2C1-SR2 hbit@ ;    \ MSL bit
-
-: i2c-SR1-wait ( u -- ) i2c.timeout @ begin 1- 2dup 0= swap i2c-SR1-flag? or until 2drop ; \ Waits until SR1 meets bit mask or timeout
-: i2c-SR1-!wait ( u -- ) i2c.timeout @ begin 1- 2dup 0= swap i2c-SR1-flag? 0= or until 2drop ; \ Waits until SR1 has zero on bit mask or timeout
-: i2c-SR2-wait ( u -- ) i2c.timeout @ begin 1- 2dup 0= swap i2c-SR2-flag? or until 2drop ; \ Waits until SR2 meets bit mask or timeout
-: i2c-SR2-!wait ( u -- ) i2c.timeout @ begin 1- 2dup 0= swap i2c-SR2-flag? 0= or until 2drop ; \ Waits until SR2 has zero on bit mask or timeout
-
-0  bit constant i2c-SR1-SB
-1  bit constant i2c-SR1-ADDR
-2  bit constant i2c-SR1-BTF
-6  bit constant i2c-SR1-RxNE
-7  bit constant i2c-SR1-TxE
-10 bit constant i2c-SR1-AF
-
- 0 bit constant i2c-SR2-MSL
-
-\ Medium level actions, no or limited status checking
-
-: i2c-start ( -- ) \ set start bit and wait for start condition
-  i2c-start! i2c-SR1-SB i2c-SR1-wait ;
-
-: i2c-stop  ( -- )  i2c-stop! i2c-SR2-MSL i2c-SR2-!wait ; \ stop and wait
-
-: i2c-probe ( c -- nak ) \ Sets address and waits for ACK or NAK
-  i2c-start
-  shl i2c-DR! \ Send address (low bit zero)
-  i2c-SR1-AF i2c-SR1-ADDR or i2c-SR1-wait \ Wait for address sent
-  i2c-nak?    \ Put AE on stack (NAK)
-  i2c-AF-0
-  i2c-stop
-;
-
-\ STM32 EV Events
-
-: i2c-EV5   i2c-SR1-SB   i2c-SR1-wait ;
-: i2c-EV6a i2c-SR1-ADDR i2c-SR1-AF or i2c-SR1-wait ; \ performs the wait, does not clear ADDR
-: i2c-EV6b I2C1-SR1 h@ drop I2C1-SR2 h@ drop ;       \ clears ADDR
-: i2c-EV6 i2c-EV6a i2c-EV6b ;                        \ Performs full EV6 action
-: i2c-EV8_1 i2c-SR1-TxE  i2c-SR1-wait ;
-: i2c-EV7   i2c-SR1-RxNE i2c-SR1-wait ;
-: i2c-EV7_2 i2c-SR1-BTF  i2c-SR1-wait ;
-: i2c-EV8_2 i2c-EV8_1 i2c-EV7_2 ;                    \ Empty outgoing data
-
-\ Compatibility layer
-
-: i2c-addr ( u --) \ Start a new transaction and send address in write mode
-  i2c-start
-  shl dup i2c.addr !
-  i2c-EV5
-
-  i2c-DR!                   \ Sends address (write mode)
-  i2c-EV6a                  \ wait for completion of addressing or AF
-;
-
-: i2c-xfer ( u -- nak ) \ prepares for reading an nbyte reply.
-                        \ Use after i2c-addr. Stops i2c after completion.
-  dup i2c.cnt !
-  i2c-EV6b
-    case
-      2 of    \ cnt = 2
-        i2c-start  \ set start bit,  wait for start condition
-
-        i2c.addr @ 1 or \ Send address with read bit
-        i2c-DR!
-
-        i2c-POS-1 i2c-ACK-1
-
-        i2c-EV6                  \ wait for ADDR and clear
-        i2c-ACK-0
-        i2c-SR1-BTF i2c-SR1-wait \ wait for BTF
-        i2c-nak?
-        i2c-stop!                \ set stop without waiting
-        0 i2c.needstop !
-      endof
-      1 of                      ( cnt = 1 )
-        i2c-start                  \ set start bit,  wait for start condition
-        i2c.addr @ 1 or            \ Send address with read bit
-        i2c-DR!
-        i2c-POS-1 i2c-ACK-1
-        i2c-EV6a                   \ Wait for addr, do not clear yet
-        i2c-ACK-0                  \ Disable ACK
-        i2c-EV6b                   \ Clear ADDR
-        i2c-nak?
-        i2c-stop!                  \ Trigger a stop
-        0 i2c.needstop !
-      endof
-      0 of                      ( cnt = 0, probe only )
-        i2c-EV8_2                  \ Flush outbound data first
-        i2c-nak? i2c-AF-0          \ push nak flag & clear it
+  if \ #TX=0
+    i2c.cnt @ case
+      0 of                                   \ Probe
+        i2c-start
+        0 i2c-send-addr
         i2c-stop
-        0 i2c.needstop !        
       endof
-      ( default: n > 2 )
-        i2c-start  \ set start bit,  wait for start condition
-
-        i2c.addr @ 1 or \ Send address with read bit
-        i2c-DR!
-        i2c-EV6    \ wait until ready to read
-        \ i2c-SR1-ADDR i2c-SR1-wait
-        i2c-nak?
-        1 i2c.needstop !
-    endcase
-;
-
-: >i2c  ( u -- ) \ Sends a byte over i2c. Use after i2c-addr
-  i2c-EV6b                \ Just in case the ADDR needs clearing
-  i2c-EV8_1
-  i2c-DR!
-;
-
-: i2c>
-
-  i2c.needstop @
-  if    \ need to do stop stuff when i2c-xfer could not
-    i2c.cnt @
-    case
-      3 of                      ( prepare for last bytes )
-        i2c-EV7_2
-        i2c-ACK-0
-        i2c-DR@
-        -1 i2c.cnt +!
-        i2c-stop!
+      1 of                                   \ Receive 1 byte
+        i2c-start
+        i2c-rx-1
+        i2c-stop
       endof
-      2 of
-        i2c-DR@
-        -1 i2c.cnt +!
-        0 i2c.needstop !
-        \ no further special handling needed
-        \ Last byte follows normal protocol
-      endof                     ( default action cnt > 3, simple receive )
-      i2c-EV7    \ wait until data received
-      i2c-DR@
-      -1 i2c.cnt +!
+      ( #rx)
+      12 bit I2C1-CR2  hbis!                 \ LAST
+      7 i2c-dma-enable
+      i2c-start
+      1 i2c-send-addr swap ( nak #rx)
+      \ DMA will handle rx from here on
     endcase
-
-  else  \ stop stuff was handled in i2c-xfer
-    i2c-EV7    \ wait until data received
-    i2c-DR@
-    -1 i2c.cnt +!
+  else \ #TX > 0
+    6 i2c-dma-enable
+    i2c-start
+    0 i2c-send-addr
+    \ DMA will handle tx from here, then stop
   then
-
-  i2c.cnt @ 0=
-  if
-    i2c-POS-0 i2c-ACK-1
-    i2c-DR@ drop                ( Do not understand why I need this )
+  \ If nak, stop communication
+  dup 0<> if
+    i2c-stop
+    i2c-SR1-AF i2c1-SR1 hbic!                \ Clear the NAK flag; necessary?
+    9 bit I2C1-CR1 hbic! 
   then
 ;
 
-: i2c>h
-    i2c>   i2c>  8 lshift or
-;
+: >i2c         ( u -- ) \ Queues byte u for transmission over i2c. Use after i2c-addr
+  i2c.txbuf >ring ;
 
-: i2c>h_inv
-    i2c>  8 lshift i2c>  or
-;
+: i2c>         ( -- u ) \ Receives 1 byte from i2c. Use after i2c-xfer. Waits.
+  begin i2c.rxbuf ring# 0<> until 
+  i2c.rxbuf ring> ;
 
-\ High level transactions
+: i2c>h        ( -- u ) \ Receives 16 bit word from i2c, lsb first.
+    i2c>   i2c>  8 lshift or ;
 
-: i2c. ( -- )  \ scan and report all I2C devices on the bus
+: i2c>h_inv    ( -- u ) \ Receives 16 bit word from i2c, msb first.
+    i2c>  8 lshift i2c>  or ;
+
+: i2c-probe ( addr -- nak )
+  i2c-addr 0 i2c-xfer
+  ;
+
+: i2c.         ( -- )   \ scan and report all I2C devices on the bus
   128 0 do
     cr i h.2 ." :"
     16 0 do  space i j +

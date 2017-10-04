@@ -1,7 +1,7 @@
 \ interface to 128x64 OLED
 \ uses i2c
 
-[ifndef] OLED.LARGE  1 constant OLED.LARGE  [then]  \ 0 = 128x32, 1 = 128x64
+[ifndef] OLED.LARGE  0 constant OLED.LARGE  [then]  \ 0 = 128x32, 1 = 128x64
 
 : lcd? ( -- f )  \ probe whether device exists, return true if it does
   $3C i2c-addr 0 i2c-xfer 0= ;
