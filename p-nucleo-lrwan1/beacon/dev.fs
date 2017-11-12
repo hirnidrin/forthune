@@ -4,6 +4,6 @@
 compiletoram? [if]  forgetram  [then]
 
 \ this part will go to ../board.fs when stable
-include ../../flib/spi/sx1272.fs
+include ../../flib-my/spi/sx1272lora.fs
 
 \ here comes the app
